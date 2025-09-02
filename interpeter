@@ -1,0 +1,205 @@
+# === Replace the EpisodeLog dataclass with this version ===
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, roc_auc_score
+import torch
+import torch.nn as nn
+
+@dataclass
+class EpisodeLog:
+    episode_id: int
+    seed: int
+    frames: List["FrameLog"]
+    remap_times_v: List[int] = field(default_factory=list)
+    remap_times_a: List[int] = field(default_factory=list)
+    swap_events: List[Tuple[int, int, int]] = field(default_factory=list)  # (t, eid_a, eid_b)
+    reached_full_length: bool = False
+    final_energy: float = 0.0
+    steps_run: int = 0
+    # NEW: environment-step visibility times per entity (any modality present)
+    vis_times: Dict[int, List[int]] = field(default_factory=dict)
+
+
+# === Replace collect_episode with this version (fixes (3) kept; adds vis_times tracking each step) ===
+@torch.no_grad()
+def collect_episode(agent, env, episode_id: int, cfg: "EvalConfig") -> EpisodeLog:
+    """
+    Frozen, deterministic evaluation with greedy actions.
+    Embeddings collected every cfg.stride steps. Visibility tracked EVERY step.
+    """
+    agent.eval()
+    obs, info = env.reset()
+    obs_dim = obs.shape[0]
+    device = next(agent.parameters()).device if isinstance(agent, nn.Module) else "cpu"
+    h = torch.zeros(1, 1, getattr(agent, "hidden_dim", 128), device=device)
+
+    frames: List[FrameLog] = []
+    remap_times_v: List[int] = []
+    remap_times_a: List[int] = []
+    swap_events: List[Tuple[int, int, int]] = []
+
+    last_pv = info.get("period_v", 0)
+    last_pa = info.get("period_a", 0)
+
+    n_slots = env.config.n_slots
+    k = env.config.features_per_slot
+
+    def greedy_action(logits: torch.Tensor) -> int:
+        return int(torch.argmax(logits, dim=-1).item())
+
+    # NEW: per-entity environment-step visibility times
+    vis_times: Dict[int, List[int]] = {}
+
+    t = 0
+    steps_run = 0
+    done = False
+    final_energy = info.get("agent_energy", 0.0)
+
+    while not done:
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=device).view(1, 1, obs_dim)
+        out, h1 = agent.gru(obs_t, h)
+        logits = agent.pi(out)[:, -1, :]
+        a = greedy_action(logits)
+
+        # === Visibility tracking at EVERY env step (stride-independent) ===
+        slot_map: Dict[int, int] = info.get("slot_to_entity", {})
+        # infer modality presence from features
+        vis_present_step: Dict[int, bool] = {}
+        aud_present_step: Dict[int, bool] = {}
+        for slot, eid in slot_map.items():
+            sf = obs_t[:, :, slot * k : (slot + 1) * k].view(-1).detach().cpu().numpy()
+            v_present = not (np.allclose(sf[0:2], 0.0) and np.allclose(sf[2:4], 0.0))
+            a_present = not (np.allclose(sf[4:6], 0.0) and np.allclose(sf[6:8], 0.0))
+            vis_present_step[eid] = v_present
+            aud_present_step[eid] = a_present
+            if v_present or a_present:
+                vis_times.setdefault(eid, []).append(t)
+
+        # === Embedding collection at stride steps ===
+        if (t % cfg.stride) == 0:
+            embeddings: Dict[int, np.ndarray] = {}
+            for slot, eid in slot_map.items():
+                slot_feats = obs_t[:, :, slot * k : (slot + 1) * k]
+                z = agent.entity_embedding(h.squeeze(0), slot_feats.squeeze(0)).squeeze(0).detach().cpu().numpy()
+                embeddings[eid] = z
+            frames.append(FrameLog(
+                t=t,
+                period_v=info.get("period_v", 0),
+                period_a=info.get("period_a", 0),
+                slot_to_entity=slot_map.copy(),
+                embeddings=embeddings,
+                vis_present={eid: vis_present_step.get(eid, False) for eid in embeddings.keys()},
+                aud_present={eid: aud_present_step.get(eid, False) for eid in embeddings.keys()},
+            ))
+
+        # Step env
+        obs, reward, done, info = env.step(a)
+        steps_run += 1
+        t += 1
+        final_energy = info.get("agent_energy", final_energy)
+
+        pv = info.get("period_v", last_pv)
+        pa = info.get("period_a", last_pa)
+        if pv > last_pv:
+            remap_times_v.append(t)
+        if pa > last_pa:
+            remap_times_a.append(t)
+        last_pv, last_pa = pv, pa
+
+        for ev in info.get("swap_events", []):
+            swap_events.append(tuple(ev))
+
+        if done:
+            break
+
+        h = h1  # advance hidden state
+
+    reached_full = (steps_run >= env.config.episode_length)
+    return EpisodeLog(
+        episode_id=episode_id,
+        seed=info.get("episode_seed", 0),
+        frames=frames,
+        remap_times_v=remap_times_v,
+        remap_times_a=remap_times_a,
+        swap_events=swap_events,
+        reached_full_length=reached_full,
+        final_energy=final_energy,
+        steps_run=steps_run,
+        vis_times=vis_times,  # NEW
+    )
+
+
+# === Replace occlusion_auc_episode with this version (fixes (1) and (2)) ===
+def occlusion_auc_episode(ep: EpisodeLog, min_pre: int = 2, min_post: int = 2) -> Optional[float]:
+    """
+    Occlusion AUC using *environment-step* visibility, independent of sampling stride.
+    For each entity, detect occlusion spans from visibility times:
+      visible ... [t1] then invisible for >=1 step ... [t2] visible again
+      -> occlusion = [t1+1, t2-1]
+    Pre buffer: choose PRE time <= (t1+1 - min_pre)
+    Post buffer: choose POST time >= (t2-1 + min_post)
+    PRE/POST embeddings are taken from nearest collected frames at/<= or at/>= those targets.
+    Returns ROC AUC over cosine similarities between positive same-entity pairs vs impostors.
+    """
+    # Build fast lookups: frame time -> frame, and per-entity frame times with embeddings
+    if not ep.frames:
+        return None
+    t_to_frame = {fr.t: fr for fr in ep.frames}
+    e_frame_times: Dict[int, List[int]] = {}
+    for fr in ep.frames:
+        for eid in fr.embeddings.keys():
+            e_frame_times.setdefault(eid, []).append(fr.t)
+    for eid in e_frame_times:
+        e_frame_times[eid].sort()
+
+    pos, neg = [], []
+
+    for eid, vis_list in ep.vis_times.items():
+        if len(vis_list) < 2:
+            continue
+        vis_list_sorted = sorted(vis_list)
+        # Detect gaps in visibility of >=1 env step
+        for i in range(1, len(vis_list_sorted)):
+            t_prev_vis = vis_list_sorted[i - 1]
+            t_next_vis = vis_list_sorted[i]
+            if t_next_vis > t_prev_vis + 1:
+                occl_start = t_prev_vis + 1
+                occl_end   = t_next_vis - 1
+
+                pre_target  = occl_start - min_pre
+                post_target = occl_end   + min_post
+
+                # find nearest collected PRE frame time <= pre_target with embedding for eid
+                pre_times = [t for t in e_frame_times.get(eid, []) if t <= pre_target]
+                post_times = [t for t in e_frame_times.get(eid, []) if t >= post_target]
+                if not pre_times or not post_times:
+                    continue
+                t_pre  = max(pre_times)
+                t_post = min(post_times)
+
+                # fetch embeddings
+                z_pre  = t_to_frame[t_pre].embeddings.get(eid)
+                z_post = t_to_frame[t_post].embeddings.get(eid)
+                if z_pre is None or z_post is None:
+                    continue
+
+                pos.append(_cosine(z_pre, z_post))
+
+                # impostors at post frame
+                fr_post = t_to_frame[t_post]
+                for other_eid, z_other in fr_post.embeddings.items():
+                    if other_eid == eid:
+                        continue
+                    neg.append(_cosine(z_pre, z_other))
+
+    if len(pos) == 0 or len(neg) == 0:
+        return None
+    y = np.array([1] * len(pos) + [0] * len(neg), dtype=np.int32)
+    s = np.array(pos + neg, dtype=np.float32)
+    try:
+        return float(roc_auc_score(y, s))
+    except Exception:
+        return None
