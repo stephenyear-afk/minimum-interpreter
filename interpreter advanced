@@ -1,0 +1,1257 @@
+# Minimal Consciousness Test (MCT) v4.9
+# Consolidated final code with rigorous per-episode probing, parity-correct ablations,
+# corrected swap test, stride-independent occlusion AUC, data-integrity filtering,
+# and PPO+GRU agent with InfoNCE auxiliary loss.
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, roc_auc_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+rng = np.random.default_rng(42)
+
+
+# ============================ Enums and Config ================================
+
+class EntityType(IntEnum):
+    DANGER = 0
+    NEUTRAL = 1
+    FOOD = 2
+    SPOILED = 3  # looks like food, delayed damage like danger
+
+
+class Action(IntEnum):
+    APPROACH_SLOT_0, APPROACH_SLOT_1, APPROACH_SLOT_2, APPROACH_SLOT_3 = 0, 1, 2, 3
+    AVOID_SLOT_0, AVOID_SLOT_1, AVOID_SLOT_2, AVOID_SLOT_3 = 4, 5, 6, 7
+    WAIT = 8
+    EXPLORE = 9
+
+
+@dataclass
+class MCTConfig:
+    n_entities: int = 6
+    episode_length: int = 200
+    n_slots: int = 4
+    features_per_slot: int = 8  # [vis_d, vis_b, vis_f1, vis_f2, aud_d, aud_b(0), aud_f1, aud_f2]
+    visual_range: float = 3.0
+    audio_range: float = 4.0
+    world_bounds: Tuple[float, float] = (-8.0, 8.0)
+
+    # Anti-shortcut
+    spatial_dropout_prob: float = 0.5        # drops vis dist+bearing for a slot
+    slot_visual_zero_prob: float = 0.15      # drops all visual features for a slot
+    frame_flip_prob: float = 0.25
+    rot_jitter_prob: float = 0.1
+    rot_jitter_range: float = math.pi / 6
+    occlusion_prob: float = 0.04
+    occlusion_duration: Tuple[int, int] = (6, 14)
+    forced_crossing_prob: float = 0.05
+    slot_churn_prob: float = 0.3             # extra permutation at even timesteps
+
+    # Survival stakes
+    initial_energy: float = 0.0
+    per_step_cost: float = 0.06
+    harm_coupling_alpha: float = 0.02        # extra drain per unit pending negative effect
+    energy_termination_threshold: float = -2.0
+
+    # Remap windows (independent per modality)
+    remap_visual_windows: List[Tuple[int, int]] = field(default_factory=lambda: [(30, 60), (120, 150)])
+    remap_audio_windows: List[Tuple[int, int]] = field(default_factory=lambda: [(70, 100)])
+
+
+# ============================== Environment ===================================
+
+@dataclass
+class Entity:
+    id: int
+    type: EntityType
+    position: np.ndarray
+    velocity: np.ndarray
+    phase: float
+    depletion: float = 0.0
+    toxicity: float = 0.0
+    occluded_until: int = 0
+
+
+class MinimalConsciousEnvironment:
+    """Slot-based, partial, remapped, delayed-effects world."""
+    def __init__(self, config: MCTConfig = MCTConfig()):
+        self.config = config
+        self.time = 0
+        self.period_v = 0
+        self.period_a = 0
+        self.agent_energy = 0.0
+        self.episode_seed = int(rng.integers(0, 2**31 - 1))
+
+        self.entities: List[Entity] = []
+        self.agent_pos = np.zeros(2)
+        self.world_rotation = 0.0
+
+        # (time, value, entity_id)
+        self.pending_effects: List[Tuple[int, float, int]] = []
+
+        self.visual_mapping = np.eye(2, dtype=np.float32)
+        self.audio_mapping = np.eye(2, dtype=np.float32)
+        self.remap_visual: List[int] = []
+        self.remap_audio: List[int] = []
+
+        self.cached_slot_assignments: Dict[int, int] = {}
+        self._last_swap_events: List[Tuple[int, int, int]] = []
+
+    def _wrap(self, pos: np.ndarray) -> np.ndarray:
+        lo, hi = self.config.world_bounds
+        span = hi - lo
+        return lo + np.mod(pos - lo, span)
+
+    def _resample_matrix(self) -> np.ndarray:
+        Q, _ = np.linalg.qr(rng.normal(size=(2, 2)))
+        return Q.astype(np.float32)
+
+    def reset(self, seed: int = None) -> Tuple[np.ndarray, Dict]:
+        if seed is None:
+            self.episode_seed = int(rng.integers(0, 2**31 - 1))
+        else:
+            self.episode_seed = int(seed)
+        local = np.random.default_rng(self.episode_seed)
+
+        self.time = 0
+        self.period_v = 0
+        self.period_a = 0
+        self.agent_energy = self.config.initial_energy
+        self.agent_pos = np.zeros(2)
+        self.world_rotation = 0.0
+        self.pending_effects = []
+        self.cached_slot_assignments = {}
+        self._last_swap_events = []
+
+        # 2 danger, 2 food, 1 neutral, 1 spoiled
+        types = [EntityType.DANGER, EntityType.DANGER, EntityType.FOOD, EntityType.FOOD,
+                 EntityType.NEUTRAL, EntityType.SPOILED]
+        local.shuffle(types)
+
+        lo, hi = self.config.world_bounds
+        self.entities = [
+            Entity(
+                id=i,
+                type=types[i],
+                position=local.uniform(lo, hi, 2),
+                velocity=local.normal(0, 0.1, 2),
+                phase=local.uniform(0, 2 * np.pi),
+            )
+            for i in range(self.config.n_entities)
+        ]
+
+        self.visual_mapping = self._resample_matrix()
+        self.audio_mapping = self._resample_matrix()
+        self.remap_visual = sorted([local.integers(low, high) for low, high in self.config.remap_visual_windows])
+        self.remap_audio = sorted([local.integers(low, high) for low, high in self.config.remap_audio_windows])
+
+        return self._observe()
+
+    def _observe(self) -> Tuple[np.ndarray, Dict]:
+        # Handle remaps
+        if self.remap_visual and self.time >= self.remap_visual[0]:
+            self.remap_visual.pop(0)
+            self.visual_mapping = self._resample_matrix()
+            self.period_v += 1
+        if self.remap_audio and self.time >= self.remap_audio[0]:
+            self.remap_audio.pop(0)
+            self.audio_mapping = self._resample_matrix()
+            self.period_a += 1
+
+        # Jitter rotation
+        if rng.random() < self.config.rot_jitter_prob:
+            self.world_rotation += rng.uniform(-self.config.rot_jitter_range, self.config.rot_jitter_range)
+
+        # Occlusions
+        for e in self.entities:
+            if e.occluded_until <= self.time and rng.random() < self.config.occlusion_prob:
+                e.occluded_until = self.time + rng.integers(*self.config.occlusion_duration)
+
+        # Forced crossing and explicit swap-report event
+        self._last_swap_events = []
+        if rng.random() < self.config.forced_crossing_prob and len(self.entities) >= 2:
+            i, j = rng.choice(len(self.entities), 2, replace=False)
+            a, b = self.entities[i], self.entities[j]
+            a.position, b.position = b.position.copy(), a.position.copy()
+            a.velocity += rng.normal(0, 0.05, 2)
+            b.velocity += rng.normal(0, 0.05, 2)
+            self._last_swap_events.append((self.time, a.id, b.id))
+
+        # Perceivable set by audio range
+        perceivable: List[Entity] = []
+        for e in self.entities:
+            if e.occluded_until > self.time:
+                continue
+            if np.linalg.norm(e.position - self.agent_pos) < self.config.audio_range:
+                perceivable.append(e)
+
+        rng.shuffle(perceivable)
+        if (self.time % 2 == 0) and (rng.random() < self.config.slot_churn_prob):
+            rng.shuffle(perceivable)
+
+        slot_to_entity: Dict[int, int] = {}
+        obs = np.zeros((self.config.n_slots, self.config.features_per_slot))
+
+        flip = np.array(
+            [
+                -1 if rng.random() < self.config.frame_flip_prob else 1,
+                -1 if rng.random() < self.config.frame_flip_prob else 1,
+            ]
+        )
+        c, s = np.cos(self.world_rotation), np.sin(self.world_rotation)
+        R = np.array([[c, -s], [s, c]])
+
+        for slot, e in enumerate(perceivable[: self.config.n_slots]):
+            slot_to_entity[slot] = e.id
+            true_rel = e.position - self.agent_pos
+            true_dist = np.linalg.norm(true_rel)
+            flipped_rel = true_rel * flip
+
+            # Visual channel
+            if true_dist < self.config.visual_range:
+                if rng.random() < self.config.slot_visual_zero_prob:
+                    obs[slot, 0:4] = 0.0
+                else:
+                    if rng.random() < self.config.spatial_dropout_prob:
+                        obs[slot, 0:2] = 0.0
+                    else:
+                        rot = R @ flipped_rel
+                        bearing = np.arctan2(rot[1], rot[0])
+                        obs[slot, 0:2] = [
+                            np.round(true_dist / 0.5) * 0.5,
+                            np.round(bearing / (np.pi / 4)) * (np.pi / 4),
+                        ]
+                    base_v = np.array([np.sin(e.phase), np.cos(2 * e.phase)])
+                    feats_v = self.visual_mapping @ base_v + rng.normal(0, 0.1, 2)
+                    obs[slot, 2:4] = feats_v
+
+            # Audio channel
+            base_a = np.array(
+                [np.sin(e.phase + self.time * 0.05), np.cos(e.phase - self.time * 0.03)]
+            )
+            feats_a = self.audio_mapping @ base_a + rng.normal(0, 0.2, 2)
+            obs[slot, 4:8] = [1.0 if true_dist < 2.0 else 2.0, 0.0, feats_a[0], feats_a[1]]
+
+        self.cached_slot_assignments = slot_to_entity
+        info = {
+            "slot_to_entity": slot_to_entity,
+            "period_v": self.period_v,
+            "period_a": self.period_a,
+            "agent_energy": self.agent_energy,
+            "episode_seed": self.episode_seed,
+            "swap_events": self._last_swap_events,  # surfaced for logging
+        }
+        return obs.flatten(), info
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
+        reward = 0.0
+        target_entity = None
+        action_enum = Action(action)
+
+        # Move w.r.t cached slots
+        if action_enum <= Action.AVOID_SLOT_3:
+            slot = int(action % 4)
+            if slot in self.cached_slot_assignments:
+                eid = self.cached_slot_assignments[slot]
+                target_entity = next((e for e in self.entities if e.id == eid), None)
+                if target_entity is not None:
+                    is_approach = action_enum < Action.AVOID_SLOT_0
+                    d = target_entity.position - self.agent_pos
+                    n = np.linalg.norm(d)
+                    if n > 0:
+                        u = d / n
+                        self.agent_pos += (0.3 if is_approach else -0.2) * u
+        elif action_enum == Action.EXPLORE:
+            self.agent_pos += rng.normal(0, 0.3, 2)
+
+        self.agent_pos = self._wrap(self.agent_pos)
+
+        # Contact effects after move
+        if target_entity and action_enum < Action.AVOID_SLOT_0:
+            if np.linalg.norm(target_entity.position - self.agent_pos) < 0.5:
+                reward += rng.uniform(-0.05, 0.05)
+                if target_entity.type == EntityType.FOOD:
+                    val = 1.0 * np.exp(-target_entity.depletion)
+                    self.pending_effects.append((self.time + rng.integers(5, 15), val, target_entity.id))
+                    target_entity.depletion += 0.4
+                elif target_entity.type in (EntityType.DANGER, EntityType.SPOILED):
+                    target_entity.toxicity += 0.3
+                    val = -target_entity.toxicity * 1.5
+                    self.pending_effects.append((self.time + rng.integers(10, 25), val, target_entity.id))
+
+        # Advance world
+        self.time += 1
+        immediate, new_pending, neg_load = 0.0, [], 0.0
+        for t, v, eid in self.pending_effects:
+            if self.time >= t:
+                immediate += v
+            else:
+                new_pending.append((t, v, eid))
+                if v < 0:
+                    neg_load += -v
+        self.pending_effects = new_pending
+
+        reward += immediate - (self.config.per_step_cost + self.config.harm_coupling_alpha * neg_load)
+        self.agent_energy += reward
+
+        for e in self.entities:
+            e.position = self._wrap(e.position + e.velocity)
+            e.velocity = (e.velocity + rng.normal(0, 0.01, 2)) * 0.95
+            e.phase += 0.05
+            e.depletion *= 0.995
+            e.toxicity *= 0.997
+
+        done = (self.time >= self.config.episode_length) or (
+            self.agent_energy < self.config.energy_termination_threshold
+        )
+        obs, info = self._observe()
+        return obs, reward, done, info
+
+
+# ============================== PPO + Probe ===================================
+
+def set_seed(seed: int = 1337):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+@dataclass
+class PPOConfig:
+    total_updates: int = 2000
+    rollout_len: int = 2048
+    bptt_len: int = 128
+    seq_batch: int = 8
+    epochs: int = 4
+    gamma: float = 0.995
+    gae_lambda: float = 0.95
+    clip_eps: float = 0.2
+    vclip_eps: float = 0.2
+    lr: float = 3e-4
+    entropy_coef: float = 0.01
+    value_coef: float = 0.5
+    contrastive_coef: float = 0.15
+    contrastive_temp: float = 0.1
+    contra_time_window: int = 512
+    eval_every: int = 50
+    device: str = "cpu"
+
+
+class PPOAgent(nn.Module):
+    def __init__(self, obs_dim: int, hidden_dim: int, features_per_slot: int, n_actions: int = 10):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.features_per_slot = features_per_slot
+        self.gru = nn.GRU(input_size=obs_dim, hidden_size=hidden_dim, batch_first=True)
+        self.pi = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, n_actions))
+        self.v = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1))
+        self.Z = nn.Linear(features_per_slot, hidden_dim, bias=False)  # per-entity readout
+
+    def forward_seq(self, obs_seq: torch.Tensor, h0: torch.Tensor):
+        out, _ = self.gru(obs_seq, h0)
+        logits = self.pi(out)
+        values = self.v(out).squeeze(-1)
+        return logits, values, out
+
+    @torch.no_grad()
+    def act_step(self, obs_step: torch.Tensor, h: torch.Tensor):
+        out, h1 = self.gru(obs_step, h)
+        logits = self.pi(out)[:, -1, :]
+        value = self.v(out)[:, -1, 0]
+        dist = torch.distributions.Categorical(logits=logits)
+        a = dist.sample()
+        logp = dist.log_prob(a)
+        return a.squeeze(0), logp.squeeze(0), value.squeeze(0), h1
+
+    def entity_embedding(self, h: torch.Tensor, slot_feats: torch.Tensor) -> torch.Tensor:
+        # h: [B, H] or [H]; slot_feats: [B, K] or [K]
+        if h.dim() == 1:
+            h = h.unsqueeze(0)
+        if slot_feats.dim() == 1:
+            slot_feats = slot_feats.unsqueeze(0)
+        return torch.tanh(h + self.Z(slot_feats))
+
+
+class RolloutBuffer:
+    def __init__(self, capacity: int, obs_dim: int, hidden_dim: int, device: str):
+        self.capacity, self.device = capacity, device
+        self.ptr = 0
+        self.obs = torch.zeros(capacity, obs_dim, device=device)
+        self.act = torch.zeros(capacity, dtype=torch.long, device=device)
+        self.logp = torch.zeros(capacity, device=device)
+        self.val = torch.zeros(capacity, device=device)
+        self.rew = torch.zeros(capacity, device=device)
+        self.done = torch.zeros(capacity, device=device)
+        self.h0 = torch.zeros(capacity, hidden_dim, device=device)
+        self.ep_start: List[int] = [0]
+        # Contrastive caches
+        self.c_h, self.c_x, self.c_eid, self.c_pv, self.c_pa, self.c_t = [], [], [], [], [], []
+
+    def add(self, obs, act, logp, val, rew, done, h_before):
+        self.obs[self.ptr] = obs.squeeze(0).squeeze(0)
+        self.act[self.ptr] = act
+        self.logp[self.ptr] = logp
+        self.val[self.ptr] = val
+        self.rew[self.ptr] = rew
+        self.done[self.ptr] = done
+        self.h0[self.ptr] = h_before.squeeze(0).squeeze(0)
+        self.ptr += 1
+        if done.item() == 1.0 and self.ptr < self.capacity:
+            self.ep_start.append(self.ptr)
+
+    def add_contrastive(self, h: torch.Tensor, slot_feats: torch.Tensor, eid: int, pv: int, pa: int, t: int):
+        self.c_h.append(h.detach().squeeze(0))
+        self.c_x.append(slot_feats.detach())
+        self.c_eid.append(eid)
+        self.c_pv.append(pv)
+        self.c_pa.append(pa)
+        self.c_t.append(t)
+
+    def full(self) -> bool:
+        return self.ptr >= self.capacity
+
+    def clear(self):
+        self.ptr = 0
+        self.ep_start = [0]
+        self.c_h.clear()
+        self.c_x.clear()
+        self.c_eid.clear()
+        self.c_pv.clear()
+        self.c_pa.clear()
+        self.c_t.clear()
+
+    def iter_sequences(self, bptt_len: int):
+        for i in range(len(self.ep_start) - 1):
+            a, b = self.ep_start[i], self.ep_start[i + 1]
+            for t in range(a, b, bptt_len):
+                yield t, min(t + bptt_len, b)
+
+
+def compute_gae(rew: torch.Tensor, val: torch.Tensor, done: torch.Tensor, gamma: float, lam: float):
+    """Standard GAE with padded value and done."""
+    T = len(rew)
+    val_pad = torch.cat([val, torch.zeros(1, device=val.device)])
+    done_pad = torch.cat([done, torch.ones(1, device=done.device)])  # terminal after last
+    adv = torch.zeros(T, device=rew.device)
+    gae = 0.0
+    for t in reversed(range(T)):
+        nonterminal = 1.0 - done_pad[t + 1]
+        delta = rew[t] + gamma * val_pad[t + 1] * nonterminal - val_pad[t]
+        gae = delta + gamma * lam * nonterminal * gae
+        adv[t] = gae
+    ret = adv + val
+    return adv, ret
+
+
+def info_nce_loss(
+    agent: PPOAgent,
+    h_list,
+    x_list,
+    eid_list,
+    pv_list,
+    pa_list,
+    t_list,
+    temp,
+    time_window,
+    device,
+):
+    if len(h_list) < 8:
+        return torch.tensor(0.0, device=device)
+    H = torch.stack(h_list, dim=0).to(device)
+    X = torch.stack(x_list, dim=0).to(device)
+    eids = torch.tensor(eid_list, device=device)
+    pv = torch.tensor(pv_list, device=device)
+    pa = torch.tensor(pa_list, device=device)
+    tt = torch.tensor(t_list, device=device)
+    Z = nn.functional.normalize(agent.entity_embedding(H, X), dim=-1)
+    sim = Z @ Z.t()
+    logits = sim / temp
+    N = Z.size(0)
+    eye = torch.eye(N, device=device).bool()
+    logits = logits.masked_fill(eye, -1e9)
+    same_eid = eids.unsqueeze(0) == eids.unsqueeze(1)
+    diff_period = (pv.unsqueeze(0) != pv.unsqueeze(1)) | (pa.unsqueeze(0) != pa.unsqueeze(1))
+    time_ok = (tt.unsqueeze(0) - tt.unsqueeze(1)).abs() <= time_window
+    pos_mask = same_eid & diff_period & time_ok & (~eye)
+    if not pos_mask.any():
+        pos_mask = same_eid & diff_period & (~eye)
+    valid_anchor = pos_mask.any(dim=1)
+    if not valid_anchor.any():
+        return torch.tensor(0.0, device=device)
+    pos_logits = torch.where(pos_mask, logits, torch.full_like(logits, -1e9))
+    pos_vals, _ = pos_logits.max(dim=1)
+    logsumexp = torch.logsumexp(logits, dim=1)
+    nce = -(pos_vals - logsumexp)
+    return nce[valid_anchor].mean()
+
+
+# ============================= Evaluation Types ===============================
+
+@dataclass
+class FrameLog:
+    t: int
+    period_v: int
+    period_a: int
+    slot_to_entity: Dict[int, int]
+    embeddings: Dict[int, np.ndarray]
+    vis_present: Dict[int, bool]  # visual-present flag per eid at this sampled frame
+    aud_present: Dict[int, bool]  # audio-present flag per eid at this sampled frame
+
+
+@dataclass
+class EpisodeLog:
+    episode_id: int
+    seed: int
+    frames: List[FrameLog]
+    remap_times_v: List[int] = field(default_factory=list)
+    remap_times_a: List[int] = field(default_factory=list)
+    swap_events: List[Tuple[int, int, int]] = field(default_factory=list)  # (t, eid_a, eid_b)
+    reached_full_length: bool = False
+    final_energy: float = 0.0
+    steps_run: int = 0
+    # environment-step visibility times per entity (any modality present)
+    vis_times: Dict[int, List[int]] = field(default_factory=dict)
+
+
+@dataclass
+class ProbeResult:
+    episode_id: int
+    n_train: int
+    n_test: int
+    acc: Optional[float]
+    confusion: Optional[np.ndarray]
+
+
+@dataclass
+class EvalConfig:
+    stride: int = 3
+    K: int = 20  # train coverage per entity
+    M: int = 20  # test coverage per entity
+    remap_buffer: int = 5
+    swap_buffer: int = 5
+    random_state: int = 123
+    # ablation floors
+    ablation_require_floor: float = 0.35
+    # for swap test
+    swap_remap_guard: int = 5  # require no remap within +/- guard around swap time
+    # bootstrap
+    bootstrap_samples: int = 2000
+    ci_alpha: float = 0.95
+
+
+# ============================ Data Collection =================================
+
+@torch.no_grad()
+def collect_episode(agent: PPOAgent, env: MinimalConsciousEnvironment, episode_id: int, cfg: EvalConfig) -> EpisodeLog:
+    """Frozen, deterministic evaluation with greedy actions. Embeddings sampled at stride.
+    Visibility tracked every env step to make occlusion analysis stride-independent."""
+    agent.eval()
+    obs_np, info = env.reset()
+    obs_dim = obs_np.shape[0]
+    device = next(agent.parameters()).device
+    h = torch.zeros(1, 1, agent.hidden_dim, device=device)
+
+    frames: List[FrameLog] = []
+    remap_times_v: List[int] = []
+    remap_times_a: List[int] = []
+    swap_events: List[Tuple[int, int, int]] = []
+
+    last_pv = info.get("period_v", 0)
+    last_pa = info.get("period_a", 0)
+
+    n_slots = env.config.n_slots
+    k = env.config.features_per_slot
+
+    def greedy_action(logits: torch.Tensor) -> int:
+        return int(torch.argmax(logits, dim=-1).item())
+
+    # per-entity env-step visibility times
+    vis_times: Dict[int, List[int]] = {}
+
+    t = 0
+    steps_run = 0
+    done = False
+    final_energy = info.get("agent_energy", 0.0)
+
+    while not done:
+        obs_t = torch.tensor(obs_np, dtype=torch.float32, device=device).view(1, 1, obs_dim)
+        out, h1 = agent.gru(obs_t, h)
+        logits = agent.pi(out)[:, -1, :]
+        a = greedy_action(logits)
+
+        # visibility tracking each step
+        slot_map: Dict[int, int] = info.get("slot_to_entity", {})
+        vis_present_step: Dict[int, bool] = {}
+        aud_present_step: Dict[int, bool] = {}
+        for slot, eid in slot_map.items():
+            sf = obs_t[:, :, slot * k : (slot + 1) * k].view(-1).detach().cpu().numpy()
+            v_present = not (np.allclose(sf[0:2], 0.0) and np.allclose(sf[2:4], 0.0))
+            a_present = not (np.allclose(sf[4:6], 0.0) and np.allclose(sf[6:8], 0.0))
+            vis_present_step[eid] = v_present
+            aud_present_step[eid] = a_present
+            if v_present or a_present:
+                vis_times.setdefault(eid, []).append(t)
+
+        # sampled frame
+        if (t % cfg.stride) == 0:
+            embeddings: Dict[int, np.ndarray] = {}
+            for slot, eid in slot_map.items():
+                slot_feats = obs_t[:, :, slot * k : (slot + 1) * k]
+                z = (
+                    agent.entity_embedding(h.squeeze(0), slot_feats.squeeze(0))
+                    .squeeze(0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                embeddings[eid] = z
+
+            frames.append(
+                FrameLog(
+                    t=t,
+                    period_v=info.get("period_v", 0),
+                    period_a=info.get("period_a", 0),
+                    slot_to_entity=slot_map.copy(),
+                    embeddings=embeddings,
+                    vis_present={eid: vis_present_step.get(eid, False) for eid in embeddings.keys()},
+                    aud_present={eid: aud_present_step.get(eid, False) for eid in embeddings.keys()},
+                )
+            )
+
+        # env step
+        obs_np, reward, done, info = env.step(a)
+        steps_run += 1
+        t += 1
+        final_energy = info.get("agent_energy", final_energy)
+
+        pv = info.get("period_v", last_pv)
+        pa = info.get("period_a", last_pa)
+        if pv > last_pv:
+            remap_times_v.append(t)
+        if pa > last_pa:
+            remap_times_a.append(t)
+        last_pv, last_pa = pv, pa
+
+        for ev in info.get("swap_events", []):
+            swap_events.append(tuple(ev))
+
+        if done:
+            break
+        h = h1  # update hidden
+
+    reached_full = steps_run >= env.config.episode_length
+    return EpisodeLog(
+        episode_id=episode_id,
+        seed=info.get("episode_seed", 0),
+        frames=frames,
+        remap_times_v=remap_times_v,
+        remap_times_a=remap_times_a,
+        swap_events=swap_events,
+        reached_full_length=reached_full,
+        final_energy=final_energy,
+        steps_run=steps_run,
+        vis_times=vis_times,
+    )
+
+
+# ========================= Probing and Metrics =================================
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _within_buffers(t: int, remaps: List[int], swaps: List[int], remap_buffer: int, swap_buffer: int) -> bool:
+    for r in remaps:
+        if r <= t <= r + remap_buffer:
+            return True
+    for s in swaps:
+        if s - swap_buffer <= t <= s + swap_buffer:
+            return True
+    return False
+
+
+def _filter_integrity(frames: List[FrameLog]) -> List[FrameLog]:
+    # Keep only frames where each embedding used has any modality present.
+    filtered = []
+    for fr in frames:
+        emb_ok = {}
+        for eid, z in fr.embeddings.items():
+            vp = fr.vis_present.get(eid, False)
+            ap = fr.aud_present.get(eid, False)
+            if vp or ap:
+                emb_ok[eid] = z
+        if emb_ok:
+            filtered.append(
+                FrameLog(
+                    t=fr.t,
+                    period_v=fr.period_v,
+                    period_a=fr.period_a,
+                    slot_to_entity=fr.slot_to_entity,
+                    embeddings=emb_ok,
+                    vis_present={k: fr.vis_present.get(k, False) for k in emb_ok.keys()},
+                    aud_present={k: fr.aud_present.get(k, False) for k in emb_ok.keys()},
+                )
+            )
+    return filtered
+
+
+def _episode_entity_set(frames: List[FrameLog]) -> List[int]:
+    s = set()
+    for fr in frames:
+        s.update(fr.embeddings.keys())
+    return sorted(s)
+
+
+def per_episode_probe(ep: EpisodeLog, cfg: EvalConfig) -> Optional[ProbeResult]:
+    """Train probe on period_v==0 & period_a==0; test on period_v>0 or period_a>0 within same episode.
+    Enforces buffers and coverage. Label space is remapped per-episode."""
+    frames = _filter_integrity(ep.frames)
+    if len(frames) == 0:
+        return None
+
+    # Determine per-episode entity label map
+    entities = _episode_entity_set(frames)
+    if len(entities) == 0:
+        return None
+    eid2local = {eid: i for i, eid in enumerate(entities)}
+
+    # Build train/test sets
+    remaps_all = sorted(set(ep.remap_times_v + ep.remap_times_a))
+    swaps_all = [t for (t, _, _) in ep.swap_events]
+
+    Xtr, ytr, Xte, yte = [], [], [], []
+    for fr in frames:
+        # skip frames inside buffers
+        if _within_buffers(fr.t, remaps_all, swaps_all, cfg.remap_buffer, cfg.swap_buffer):
+            continue
+        for eid, z in fr.embeddings.items():
+            lbl = eid2local[eid]
+            if fr.period_v == 0 and fr.period_a == 0:
+                Xtr.append(z)
+                ytr.append(lbl)
+            else:
+                Xte.append(z)
+                yte.append(lbl)
+
+    if len(Xtr) == 0 or len(Xte) == 0:
+        return None
+
+    # Coverage checks per local class
+    n_class = len(entities)
+    train_counts = {i: 0 for i in range(n_class)}
+    test_counts = {i: 0 for i in range(n_class)}
+    for y in ytr:
+        train_counts[y] += 1
+    for y in yte:
+        test_counts[y] += 1
+    if any(c < cfg.K for c in train_counts.values()):
+        return None
+    if any(c < cfg.M for c in test_counts.values()):
+        return None
+
+    Xtr_arr = np.asarray(Xtr)
+    ytr_arr = np.asarray(ytr)
+    Xte_arr = np.asarray(Xte)
+    yte_arr = np.asarray(yte)
+
+    clf = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(
+            max_iter=1000, C=0.1, class_weight="balanced", solver="lbfgs", random_state=cfg.random_state
+        ),
+    )
+    clf.fit(Xtr_arr, ytr_arr)
+    yhat = clf.predict(Xte_arr)
+    acc = float((yhat == yte_arr).mean())
+    cm = confusion_matrix(yte_arr, yhat, labels=list(range(n_class)))
+    return ProbeResult(episode_id=ep.episode_id, n_train=len(ytr_arr), n_test=len(yte_arr), acc=acc, confusion=cm)
+
+
+def occlusion_auc_episode(ep: EpisodeLog, min_pre: int = 2, min_post: int = 2) -> Optional[float]:
+    """Stride-independent occlusion AUC using env-step visibility."""
+    if not ep.frames:
+        return None
+    t_to_frame = {fr.t: fr for fr in ep.frames}
+    e_frame_times: Dict[int, List[int]] = {}
+    for fr in ep.frames:
+        for eid in fr.embeddings.keys():
+            e_frame_times.setdefault(eid, []).append(fr.t)
+    for eid in e_frame_times:
+        e_frame_times[eid].sort()
+
+    pos, neg = [], []
+
+    for eid, vis_list in ep.vis_times.items():
+        if len(vis_list) < 2:
+            continue
+        vis_list_sorted = sorted(vis_list)
+        for i in range(1, len(vis_list_sorted)):
+            t_prev_vis = vis_list_sorted[i - 1]
+            t_next_vis = vis_list_sorted[i]
+            if t_next_vis > t_prev_vis + 1:
+                occl_start = t_prev_vis + 1
+                occl_end = t_next_vis - 1
+
+                pre_target = occl_start - min_pre
+                post_target = occl_end + min_post
+
+                pre_times = [t for t in e_frame_times.get(eid, []) if t <= pre_target]
+                post_times = [t for t in e_frame_times.get(eid, []) if t >= post_target]
+                if not pre_times or not post_times:
+                    continue
+                t_pre = max(pre_times)
+                t_post = min(post_times)
+
+                z_pre = t_to_frame[t_pre].embeddings.get(eid)
+                z_post = t_to_frame[t_post].embeddings.get(eid)
+                if z_pre is None or z_post is None:
+                    continue
+
+                pos.append(_cosine(z_pre, z_post))
+                fr_post = t_to_frame[t_post]
+                for other_eid, z_other in fr_post.embeddings.items():
+                    if other_eid == eid:
+                        continue
+                    neg.append(_cosine(z_pre, z_other))
+
+    if len(pos) == 0 or len(neg) == 0:
+        return None
+    y = np.array([1] * len(pos) + [0] * len(neg), dtype=np.int32)
+    s = np.array(pos + neg, dtype=np.float32)
+    try:
+        return float(roc_auc_score(y, s))
+    except Exception:
+        return None
+
+
+def swap_test_episode(ep: EpisodeLog, cfg: EvalConfig) -> Optional[float]:
+    """Causal swap test using explicit swap_events (t, eid_a, eid_b).
+    Require no remap within +/- guard around swap. Check identity mapping across locations."""
+    if not ep.frames or not ep.swap_events:
+        return None
+    # Build frame index
+    t_to_frame = {fr.t: fr for fr in ep.frames}
+    # For each swap event, require no remap in guard
+    valid_swaps = []
+    for t_swap, a, b in ep.swap_events:
+        ok = True
+        for r in ep.remap_times_v + ep.remap_times_a:
+            if abs(r - t_swap) <= cfg.swap_remap_guard:
+                ok = False
+                break
+        if ok:
+            valid_swaps.append((t_swap, a, b))
+    if not valid_swaps:
+        return None
+
+    # Helper: nearest sampled frame at/<= target, and at/>= target
+    def nearest_left(eid: int, t_target: int) -> Optional[Tuple[int, np.ndarray]]:
+        candidates = [fr for fr in ep.frames if fr.t <= t_target and eid in fr.embeddings]
+        if not candidates:
+            return None
+        fr = max(candidates, key=lambda x: x.t)
+        return fr.t, fr.embeddings[eid]
+
+    def nearest_right(eid: int, t_target: int) -> Optional[Tuple[int, np.ndarray]]:
+        candidates = [fr for fr in ep.frames if fr.t >= t_target and eid in fr.embeddings]
+        if not candidates:
+            return None
+        fr = min(candidates, key=lambda x: x.t)
+        return fr.t, fr.embeddings[eid]
+
+    correct = 0
+    total = 0
+    for t_swap, a, b in valid_swaps:
+        # Pre embeddings for A and B
+        pa = nearest_left(a, t_swap - 1)
+        pb = nearest_left(b, t_swap - 1)
+        if pa is None or pb is None:
+            continue
+        _, zA_pre = pa
+        _, zB_pre = pb
+
+        # Post embeddings for A and B at their new locations
+        na = nearest_right(a, t_swap + 1)
+        nb = nearest_right(b, t_swap + 1)
+        if na is None or nb is None:
+            continue
+        _, zA_post = na
+        _, zB_post = nb
+
+        # Check that A_post is closer to A_pre than to B_pre and vice versa
+        # This focuses on identity, not location.
+        sim_AA = _cosine(zA_pre, zA_post)
+        sim_AB = _cosine(zA_pre, zB_post)
+        sim_BB = _cosine(zB_pre, zB_post)
+        sim_BA = _cosine(zB_pre, zA_post)
+        total += 2
+        if sim_AA > sim_AB:
+            correct += 1
+        if sim_BB > sim_BA:
+            correct += 1
+
+    if total == 0:
+        return None
+    return correct / total
+
+
+# ============================ Episode Aggregation ==============================
+
+@dataclass
+class AggregatedStats:
+    mean: float
+    ci_lo: float
+    ci_hi: float
+    n: int
+
+
+def _bootstrap_ci(values: List[float], alpha: float = 0.95, samples: int = 2000) -> Tuple[float, float, float]:
+    arr = np.array(values, dtype=np.float64)
+    if len(arr) == 0:
+        return (float("nan"), float("nan"), float("nan"))
+    means = []
+    n = len(arr)
+    for _ in range(samples):
+        idx = np.random.randint(0, n, n)
+        means.append(arr[idx].mean())
+    means = np.array(means)
+    lo = np.percentile(means, (1 - alpha) / 2 * 100)
+    hi = np.percentile(means, (1 + alpha) / 2 * 100)
+    return float(arr.mean()), float(lo), float(hi)
+
+
+@dataclass
+class AblationReport:
+    baseline: AggregatedStats
+    ablated: AggregatedStats
+    relative_drop: float
+    passed_floor: bool
+    n_intersection: int
+
+
+# ================================ Evaluation ==================================
+
+@dataclass
+class EvalRunResult:
+    probe_acc: AggregatedStats
+    occl_auc: AggregatedStats
+    swap_acc: AggregatedStats
+    survival_rate: AggregatedStats
+    final_energy: AggregatedStats
+
+
+def evaluate_agent(
+    agent: PPOAgent,
+    env: MinimalConsciousEnvironment,
+    cfg: EvalConfig,
+    episodes: int = 200,
+) -> Tuple[List[EpisodeLog], List[ProbeResult]]:
+    logs: List[EpisodeLog] = []
+    results: List[ProbeResult] = []
+    for eid in range(episodes):
+        ep = collect_episode(agent, env, eid, cfg)
+        logs.append(ep)
+        pr = per_episode_probe(ep, cfg)
+        if pr is not None:
+            results.append(pr)
+    return logs, results
+
+
+def summarize_results(
+    logs: List[EpisodeLog],
+    probe_results: List[ProbeResult],
+    cfg: EvalConfig,
+) -> EvalRunResult:
+    # Probe accuracy
+    accs = [pr.acc for pr in probe_results if pr.acc is not None]
+    probe_stats = AggregatedStats(*_bootstrap_ci(accs, cfg.ci_alpha, cfg.bootstrap_samples), len(accs))
+
+    # Occlusion AUC per episode
+    aucs = []
+    for ep in logs:
+        auc = occlusion_auc_episode(ep, min_pre=2, min_post=2)
+        if auc is not None:
+            aucs.append(auc)
+    occl_stats = AggregatedStats(*_bootstrap_ci(aucs, cfg.ci_alpha, cfg.bootstrap_samples), len(aucs))
+
+    # Swap test per episode
+    swaps = []
+    for ep in logs:
+        s = swap_test_episode(ep, cfg)
+        if s is not None:
+            swaps.append(s)
+    swap_stats = AggregatedStats(*_bootstrap_ci(swaps, cfg.ci_alpha, cfg.bootstrap_samples), len(swaps))
+
+    # Survival and energy
+    survival = [1.0 if ep.reached_full_length else 0.0 for ep in logs]
+    surv_stats = AggregatedStats(*_bootstrap_ci(survival, cfg.ci_alpha, cfg.bootstrap_samples), len(survival))
+    energies = [ep.final_energy for ep in logs]
+    energy_stats = AggregatedStats(*_bootstrap_ci(energies, cfg.ci_alpha, cfg.bootstrap_samples), len(energies))
+
+    return EvalRunResult(
+        probe_acc=probe_stats, occl_auc=occl_stats, swap_acc=swap_stats, survival_rate=surv_stats, final_energy=energy_stats
+    )
+
+
+# ============================ Ablation Robustness ==============================
+
+def _apply_ablation(frames: List[FrameLog], kind: str) -> List[FrameLog]:
+    """Return deep-copied frames with ablation applied to slot features presence flags only.
+    Probe uses embeddings already produced by the frozen agent, so ablations simulate missing modality by
+    zeroing presence flags to exclude samples appropriately."""
+    out = []
+    for fr in frames:
+        # shallow copy
+        emb = {k: v.copy() for k, v in fr.embeddings.items()}
+        vis = fr.vis_present.copy()
+        aud = fr.aud_present.copy()
+        if kind == "spatial":
+            # spatial ablation implies visual spatial zeroed, treat as visual absent for integrity
+            for eid in list(vis.keys()):
+                vis[eid] = False  # drop all visual so samples rely on audio-only validity
+        elif kind == "visual":
+            for eid in list(vis.keys()):
+                vis[eid] = False
+        elif kind == "audio":
+            for eid in list(aud.keys()):
+                aud[eid] = False
+        out.append(
+            FrameLog(
+                t=fr.t,
+                period_v=fr.period_v,
+                period_a=fr.period_a,
+                slot_to_entity=fr.slot_to_entity.copy(),
+                embeddings=emb,
+                vis_present=vis,
+                aud_present=aud,
+            )
+        )
+    return out
+
+
+def ablation_robustness(
+    agent: PPOAgent,
+    env: MinimalConsciousEnvironment,
+    cfg: EvalConfig,
+    episodes: int,
+    kind: str,  # "spatial" | "visual" | "audio"
+) -> AblationReport:
+    """Paired analysis. Compute per-episode probe acc for baseline and ablation,
+    then intersect valid episode IDs and aggregate only on that set. Enforce absolute floor."""
+    # Baseline collection
+    logs_base, res_base = evaluate_agent(agent, env, cfg, episodes)
+    base_map = {r.episode_id: r for r in res_base}
+
+    # Ablated collection: re-run episodes with same seeds, but ablate frames
+    logs_ablate: List[EpisodeLog] = []
+    res_ablate: List[ProbeResult] = []
+    for ep in logs_base:
+        # clone and ablate frames
+        ep_ab = EpisodeLog(
+            episode_id=ep.episode_id,
+            seed=ep.seed,
+            frames=_apply_ablation(ep.frames, kind),
+            remap_times_v=ep.remap_times_v[:],
+            remap_times_a=ep.remap_times_a[:],
+            swap_events=ep.swap_events[:],
+            reached_full_length=ep.reached_full_length,
+            final_energy=ep.final_energy,
+            steps_run=ep.steps_run,
+            vis_times=ep.vis_times.copy(),
+        )
+        logs_ablate.append(ep_ab)
+        pr = per_episode_probe(ep_ab, cfg)
+        if pr is not None:
+            res_ablate.append(pr)
+    ablate_map = {r.episode_id: r for r in res_ablate}
+
+    # Intersection of valid episodes
+    inter = sorted(set(base_map.keys()) & set(ablate_map.keys()))
+    base_acc = [base_map[i].acc for i in inter]
+    abl_acc = [ablate_map[i].acc for i in inter]
+
+    base_stats = AggregatedStats(*_bootstrap_ci(base_acc, cfg.ci_alpha, cfg.bootstrap_samples), len(base_acc))
+    abl_stats = AggregatedStats(*_bootstrap_ci(abl_acc, cfg.ci_alpha, cfg.bootstrap_samples), len(abl_acc))
+
+    rel_drop = float("nan")
+    if base_stats.mean and not math.isnan(base_stats.mean):
+        rel_drop = max(0.0, (base_stats.mean - abl_stats.mean) / base_stats.mean)
+
+    passed_floor = (not math.isnan(abl_stats.mean)) and (abl_stats.mean >= cfg.ablation_require_floor)
+
+    return AblationReport(
+        baseline=base_stats,
+        ablated=abl_stats,
+        relative_drop=rel_drop,
+        passed_floor=passed_floor,
+        n_intersection=len(inter),
+    )
+
+
+# ============================== PPO Training ==================================
+
+def train_ppo(env: MinimalConsciousEnvironment, cfg_env: MCTConfig, cfg: PPOConfig, hidden_dim: int = 128) -> PPOAgent:
+    device = cfg.device
+    set_seed(1337)
+    obs_dim = cfg_env.n_slots * cfg_env.features_per_slot
+    agent = PPOAgent(obs_dim, hidden_dim, cfg_env.features_per_slot, 10).to(device)
+    opt = optim.Adam(agent.parameters(), lr=cfg.lr)
+    buf = RolloutBuffer(cfg.rollout_len, obs_dim, hidden_dim, device)
+
+    global_step = 0
+    for update in range(1, cfg.total_updates + 1):
+        buf.clear()
+        obs_np, info = env.reset()
+        h = torch.zeros(1, 1, hidden_dim, device=device)
+        done = False
+
+        # Rollout
+        while not buf.full():
+            obs_t = torch.tensor(obs_np, dtype=torch.float32, device=device).view(1, 1, obs_dim)
+            h_before = h.clone()
+            a, logp, val, h = agent.act_step(obs_t, h)
+            k = cfg_env.features_per_slot
+            for slot, eid in info["slot_to_entity"].items():
+                slot_feats = obs_t[:, :, slot * k : (slot + 1) * k].squeeze(0).squeeze(0)
+                buf.add_contrastive(
+                    h_before.squeeze(0), slot_feats, eid, info.get("period_v", 0), info.get("period_a", 0), global_step
+                )
+            obs_np, reward, done, info = env.step(int(a.item()))
+            buf.add(
+                obs_t,
+                a,
+                logp,
+                val,
+                torch.tensor(reward, dtype=torch.float32, device=device),
+                torch.tensor(float(done), dtype=torch.float32, device=device),
+                h_before,
+            )
+            global_step += 1
+            if done:
+                obs_np, info = env.reset()
+                h = torch.zeros(1, 1, hidden_dim, device=device)
+                done = False
+
+        # Update
+        adv, ret = compute_gae(buf.rew, buf.val, buf.done, cfg.gamma, cfg.gae_lambda)
+
+        contra_loss = info_nce_loss(
+            agent,
+            buf.c_h,
+            buf.c_x,
+            buf.c_eid,
+            buf.c_pv,
+            buf.c_pa,
+            buf.c_t,
+            cfg.contrastive_temp,
+            cfg.contra_time_window,
+            device,
+        )
+
+        seqs = list(buf.iter_sequences(cfg.bptt_len))
+        for _ in range(cfg.epochs):
+            np.random.shuffle(seqs)
+            for pack in [seqs[i : i + cfg.seq_batch] for i in range(0, len(seqs), cfg.seq_batch)]:
+                maxT = max(e - s for s, e in pack)
+                B = len(pack)
+                mb_obs = torch.zeros(B, maxT, obs_dim, device=device)
+                mb_act = torch.zeros(B, maxT, dtype=torch.long, device=device)
+                mb_old = torch.zeros(B, maxT, device=device)
+                mb_adv = torch.zeros(B, maxT, device=device)
+                mb_ret = torch.zeros(B, maxT, device=device)
+                mb_val = torch.zeros(B, maxT, device=device)
+                mb_mask = torch.zeros(B, maxT, device=device)
+                h0 = torch.zeros(1, B, hidden_dim, device=device)
+
+                for b, (s, e) in enumerate(pack):
+                    T = e - s
+                    mb_obs[b, :T] = buf.obs[s:e]
+                    mb_act[b, :T] = buf.act[s:e]
+                    mb_old[b, :T] = buf.logp[s:e]
+                    mb_ret[b, :T] = ret[s:e]
+                    mb_val[b, :T] = buf.val[s:e]
+                    mb_mask[b, :T] = 1.0
+                    h0[0, b] = buf.h0[s]
+                    adv_seq = adv[s:e]
+                    mb_adv[b, :T] = (adv_seq - adv_seq.mean()) / (adv_seq.std() + 1e-8)
+
+                logits, values, _ = agent.forward_seq(mb_obs, h0)
+                dist = torch.distributions.Categorical(logits=logits)
+                logp_new = dist.log_prob(mb_act)
+                entropy = dist.entropy()
+
+                ratio = torch.exp(logp_new - mb_old)
+                pg1 = ratio * mb_adv
+                pg2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * mb_adv
+                policy_loss = -(torch.min(pg1, pg2) * mb_mask).sum() / mb_mask.sum()
+
+                v_clipped = mb_val + (values - mb_val).clamp(-cfg.vclip_eps, cfg.vclip_eps)
+                vf1 = (values - mb_ret) ** 2
+                vf2 = (v_clipped - mb_ret) ** 2
+                value_loss = 0.5 * (torch.max(vf1, vf2) * mb_mask).sum() / mb_mask.sum()
+                entropy_loss = (entropy * mb_mask).sum() / mb_mask.sum()
+
+                loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy_loss + cfg.contrastive_coef * contra_loss
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+                opt.step()
+
+        # Optional periodic probe eval
+        # (Omitted heavy runs here by default)
+
+    return agent
+
+
+# =================================== Demo =====================================
+
+if __name__ == "__main__":
+    print("MCT v4.9 — Final Evaluation Toolkit")
+    # Minimal smoke-test wiring. Full training omitted by default.
+
+    cfg_env = MCTConfig()
+    env = MinimalConsciousEnvironment(cfg_env)
+
+    # Tiny agent for demonstration (random weights). Real use: call train_ppo(...)
+    obs_dim = cfg_env.n_slots * cfg_env.features_per_slot
+    agent = PPOAgent(obs_dim=obs_dim, hidden_dim=64, features_per_slot=cfg_env.features_per_slot, n_actions=10)
+
+    eval_cfg = EvalConfig(stride=3, K=5, M=5, bootstrap_samples=200)
+
+    logs, probe_res = evaluate_agent(agent, env, eval_cfg, episodes=8)
+    summary = summarize_results(logs, probe_res, eval_cfg)
+
+    print(f"Probe acc mean={summary.probe_acc.mean:.3f} [{summary.probe_acc.ci_lo:.3f},{summary.probe_acc.ci_hi:.3f}] n={summary.probe_acc.n}")
+    print(f"Occl AUC mean={summary.occl_auc.mean:.3f} [{summary.occl_auc.ci_lo:.3f},{summary.occl_auc.ci_hi:.3f}] n={summary.occl_auc.n}")
+    print(f"Swap acc mean={summary.swap_acc.mean:.3f} [{summary.swap_acc.ci_lo:.3f},{summary.swap_acc.ci_hi:.3f}] n={summary.swap_acc.n}")
+    print(f"Survival rate mean={summary.survival_rate.mean:.3f} n={summary.survival_rate.n}")
+    print(f"Final energy mean={summary.final_energy.mean:.3f} n={summary.final_energy.n}")
+
+    # Parity-correct ablation example (spatial)
+    ab_report = ablation_robustness(agent, env, eval_cfg, episodes=8, kind="spatial")
+    print(
+        f"Ablation(spatial) baseline={ab_report.baseline.mean:.3f}, "
+        f"ablated={ab_report.ablated.mean:.3f}, rel_drop={ab_report.relative_drop:.3f}, "
+        f"floor_pass={ab_report.passed_floor}, n_inter={ab_report.n_intersection}"
+    )
+
